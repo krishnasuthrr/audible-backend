@@ -5,6 +5,7 @@ import sessionModel from "../models/sessionModel.js";
 import jwt from "jsonwebtoken"
 import bcrypt from "bcryptjs";
 import crypto from "crypto"
+import { ref } from "process";
 
 async function registerUser(req, res) {
     
@@ -33,7 +34,7 @@ async function registerUser(req, res) {
     
         const existingUser = await userModel.findOne({
           $or: [
-            { username: username.toLowerCase() },
+            { username },
             { email }
         ],
         });
@@ -50,9 +51,12 @@ async function registerUser(req, res) {
             password: hashedPassword
         })
 
+        const expirationTime = 1000 * 60 * 60 * 24 * 7;
+
         const session = await sessionModel.create({
           userId: user._id,
           ip: req.ip,
+          refreshTokenHash: "null",
           userAgent: req.headers["user-agent"] || "Unknown Device",
           expiresAt: new Date(Date.now() + expirationTime),
         });
@@ -60,7 +64,6 @@ async function registerUser(req, res) {
         const refreshToken = jwt.sign(
           {
             id: user._id,
-            role: user.role,
             sessionID: session._id
           },
           process.env.JWT_REFRESH_SECRET,
@@ -69,8 +72,7 @@ async function registerUser(req, res) {
           },
         );
 
-        const refreshTokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex")
-        const expirationTime = 1000 * 60 * 60 * 24 * 7;
+        const refreshTokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
 
         session.refreshTokenHash = refreshTokenHash
         await session.save()
@@ -102,6 +104,15 @@ async function registerUser(req, res) {
     
     } catch (error) {
         console.error(error)
+
+        if(error.name === "ValidationError") {
+            return res.status(400).json({ message: "Data Validation Error" })
+        }
+
+        if (error.code === 11000) {
+            return res.status(409).json({ message: "Username or Email already exists" });
+        }
+
         return res.status(500).json({ message: "Internal Server Error" })
     }
 
@@ -111,7 +122,7 @@ async function loginUser(req, res) {
 
     try {
 
-        const { identifier, password } = req.body;
+        let { identifier, password } = req.body;
         let user
     
         if(!identifier) {
@@ -120,6 +131,8 @@ async function loginUser(req, res) {
         if(!password) {
             return res.status(400).json({ message: "Enter the Password" })
         }
+
+        identifier = cleanUserInput(identifier);
     
         if(usernameValidator(identifier)) {
             user = await userModel.findOne({ username: identifier })
@@ -137,40 +150,173 @@ async function loginUser(req, res) {
         if(!isPasswordCorrect) {
             return res.status(401).json({ message: "Incorrect Password" })
         }
-    
-        const token = jwt.sign({
-            id: user._id,
-            role: user.role
-        }, process.env.JWT_SECRET, {
-            expiresIn: "1d"
+
+        const expirationTime = 1000 * 60 * 60 * 24 * 7
+
+        const session = await sessionModel.create({
+            userId: user._id,
+            refreshTokenHash: "null",
+            ip: req.ip,
+            userAgent: req.headers[ "user-agent" ],
+            expiresAt: new Date(Date.now() + expirationTime)
         })
+
+        const refreshToken = jwt.sign(
+        {
+            userID: user._id,
+            sessionID: session._id
+        },
+        process.env.JWT_REFRESH_SECRET,
+        {
+            expiresIn: "7d",
+        },
+        );
+
+        const refreshTokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex");
+
+        session.refreshTokenHash = refreshTokenHash
+        await session.save()
     
         const cookieOptions = {
           httpOnly: true,
+          secure: process.env.NODE_ENV === "production",
           sameSite: "Strict", 
-          maxAge: 1000 * 60 * 60 * 24 * 7,
+          maxAge: expirationTime,
           path: "/",
         };
     
-        res.cookie("token", token, cookieOptions);
+        res.cookie("refreshToken", refreshToken, cookieOptions);
+
+        const accessToken = jwt.sign(
+          {
+            userID: user._id,
+            role: user.role,
+            sessionID: session._id,
+          },
+          process.env.JWT_ACCESS_SECRET,
+          {
+            expiresIn: "15m",
+          },
+        );
     
-        return res.status(201).json({
+        return res.status(200).json({
           message: "User Logged In Successfully",
           user: {
               id: user._id,
-              token,
+              accessToken
           },
         });
 
     } catch (error) {
+        console.error(error)
+
+        if (error.name === "ValidationError") {
+          return res.status(400).json({ message: "Data Validation Error" });
+        }
+
         return res.status(500).json({ message: "Internal Server Error" })
     }
 
 }
 
+async function logout(req, res) {
+    
+    try {
+        
+        const refreshToken = req.cookies.refreshToken
+
+        if (!refreshToken) {
+          return res.status(200).json({ message: "Logged out" });
+        }
+
+        const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET)
+
+        res.clearCookie("refreshToken")
+
+        const refreshTokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex")
+
+        const session = await sessionModel.findOne({
+            userId: decoded.userID,
+            _id: decoded.sessionID
+        })
+
+        if (!session || session.refreshTokenHash !== refreshTokenHash) {
+            return res.status(403).json({ message: "Request Forbidden" });
+        }
+
+        session.revoked = true;
+        await session.save();
+
+        return res.status(200).json({ message: "Logged Out" })
+
+    } catch (error) {
+        console.error(error)
+
+        if (
+          error.name === "JsonWebTokenError" ||
+          error.name === "TokenExpiredError"
+        ) {
+          return res.status(401).json({ message: "Invalid Token" });
+        }
+
+        return res.status(500).json({ message: "Internal Server Error" })
+    }
+
+}
+
+async function logoutAll(req, res) {
+    
+    try {
+        
+        const refreshToken = req.cookies.refreshToken
+
+        const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET)
+
+        res.clearCookie("refreshToken")
+
+        const session = await sessionModel.updateMany(
+            { userId: decoded.userID, revoked: false },
+            { 
+                $set: { revoked: true } 
+            }
+        )
+
+        return res.status(200).json({ message: "Logged out of all Devices" })
+
+    } catch (error) {
+        console.error(error)
+
+        if (
+          error.name === "JsonWebTokenError" ||
+          error.name === "TokenExpiredError"
+        ) {
+          return res.status(401).json({ message: "Invalid Token" });
+        }
+
+        return res.status(500).json({ message: "Internal Server Error" })
+    }
+
+}
+
+
+async function generateRefreshToken(req, res) {
+    
+    const refreshToken = req.user
+
+    const refreshTokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex")
+
+    const session = await sessionModel.findOne({ userId: refreshToken.userID, refreshTokenHash })
+
+
+
+}
+
 const authControllers = {
     registerUser,
-    loginUser
+    loginUser,
+    generateRefreshToken,
+    logout,
+    logoutAll
 }
 
 export default authControllers

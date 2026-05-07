@@ -301,13 +301,81 @@ async function logoutAll(req, res) {
 
 async function generateRefreshToken(req, res) {
     
-    const refreshToken = req.user
+    try {
 
-    const refreshTokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex")
+        const refreshToken = req.cookies.refreshToken
 
-    const session = await sessionModel.findOne({ userId: refreshToken.userID, refreshTokenHash })
+        const decoded = req.user
+    
+        const refreshTokenHash = crypto.createHash("sha256").update(refreshToken).digest("hex")
+    
+        const user = await userModel.findById(decoded.userID)
+    
+        if(!user) {
+            return res.status(401).json({ message: "Unauthorized User" })
+        }
+    
+        const session = await sessionModel.findOne({
+          userId: decoded.userID,
+          _id: decoded.sessionID,
+        });
+    
+        if(!session || (session.refreshTokenHash !== refreshTokenHash)) {
+            return res.status(403).json({ message: "Request Forbidden" })
+        }
+    
+        res.clearCookie("refreshToken")
+    
+        const expirationTime = 1000 * 60 * 60 * 24 * 7
+    
+        const newRefreshToken = jwt.sign(
+            {
+                userID: decoded.userID,
+                sessionID: decoded.sessionID
+            },
+            process.env.JWT_REFRESH_SECRET,
+            {
+                expiresIn: "7d"
+            }
+        )
+    
+        const newRefreshTokenHash = crypto.createHash("sha256").update(newRefreshToken).digest("hex")
+    
+        session.refreshTokenHash = newRefreshTokenHash
+        session.expiresAt = new Date( Date.now() + expirationTime )
+        await session.save()
+    
+        const cookieOptions = {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === "production",
+            sameSite: "Strict",
+            maxAge: expirationTime,
+            path: "/"
+        }
+    
+        res.cookie("refreshToken", newRefreshToken, cookieOptions)
+    
+        const newAccessToken = jwt.sign(
+          {
+            userID: decoded.userID,
+            sessionID: decoded.sessionID,
+            role: user.role
+          },
+          process.env.JWT_REFRESH_SECRET,
+          {
+            expiresIn: "15m",
+          },
+        );
+    
+        return res.status(200).json({
+            message: "Success",
+            newAccessToken
+        })
+    } catch (error) {
+        console.error("error rotating refresh token: ", error)
 
-
+        return res.status(500).json({ message: "Internal Server Error" })
+    }
 
 }
 

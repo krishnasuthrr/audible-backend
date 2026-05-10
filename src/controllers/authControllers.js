@@ -7,6 +7,33 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto"
 import { ref } from "process";
 
+async function getUser(req, res) {
+    
+    try {
+        
+        const decoded = req.user
+
+        const user = await userModel.findById(decoded.userID)
+
+        if(!user) {
+            return res.status(401).json({ message: "Unauthorized" })
+        }
+
+        return res.status(200).json({
+            user: {
+                id: user._id,
+                username: user.username,
+                email: user.email
+            }
+        })
+
+    } catch (error) {
+        console.log("Error Getting user: ", error)
+        return res.status(500).json({ message: "Internal Server Error" })
+    }
+
+}
+
 async function registerUser(req, res) {
     
     try {
@@ -29,7 +56,7 @@ async function registerUser(req, res) {
        
         const passwordErrors = passwordValidator(password)
         if(passwordErrors.length > 0){
-            return res.status(400).json({ errors: passwordErrors })
+            return res.status(400).json({ passwordErrors: passwordErrors })
         }
     
         const existingUser = await userModel.findOne({
@@ -380,11 +407,12 @@ async function generateRefreshToken(req, res) {
 }
 
 const authControllers = {
+    getUser,
     registerUser,
     loginUser,
     generateRefreshToken,
     logout,
-    logoutAll
+    logoutAll,
 }
 
 export default authControllers

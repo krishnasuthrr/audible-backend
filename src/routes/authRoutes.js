@@ -4,6 +4,7 @@ import { authenticateUser, verifyRefreshToken } from "../middlewares/authenticat
 
 const authRouter = express.Router()
 
+authRouter.get("/get-user", verifyRefreshToken, authControllers.getUser)
 authRouter.post("/register", authControllers.registerUser);
 authRouter.post("/login", authControllers.loginUser);
 authRouter.post("/logout", authControllers.logout);
